@@ -9,7 +9,7 @@ import (
 type Link struct {
 	gorm.Model
 	ShortCode           string `gorm:"unique_index;not null"`
-	OriginalURL         string `gorm:"not null"`
+	OriginalURL         string `gorm:"index;not null"`
 	RenderedHTMLContent string `gorm:"type:text"` // Use text for potentially large HTML
 }
 
