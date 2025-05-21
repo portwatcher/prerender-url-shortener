@@ -45,3 +45,12 @@ func CreateLink(link *Link) error {
 	}
 	return nil
 }
+
+// GetLinkByOriginalURL retrieves a link by its original URL.
+func GetLinkByOriginalURL(originalURL string) (*Link, error) {
+	var link Link
+	if err := DB.Where("original_url = ?", originalURL).First(&link).Error; err != nil {
+		return nil, err
+	}
+	return &link, nil
+}

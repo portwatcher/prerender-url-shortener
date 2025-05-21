@@ -57,10 +57,21 @@ func GenerateShortCodeHandler(c *gin.Context) {
 		}
 	}
 
-	// TODO: Check if URL already exists and return existing short code if so.
-	// This requires a way to efficiently query by OriginalURL.
-	// For now, we always generate a new one, which might lead to duplicates
-	// if the same URL is submitted multiple times.
+	// Check if the URL already exists
+	existingLink, dbErr := db.GetLinkByOriginalURL(req.URL)
+	if dbErr != nil && !gorm.IsRecordNotFoundError(dbErr) {
+		log.Printf("Error checking existing link for URL %s: %v", req.URL, dbErr)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error while checking existing link"})
+		return
+	}
+	if existingLink != nil && existingLink.ID != 0 { // Check if a record was actually found
+		log.Printf("URL %s already exists with short code %s. Returning existing.", req.URL, existingLink.ShortCode)
+		c.JSON(http.StatusOK, GenerateResponse{ // Changed to StatusOK as we are returning existing data
+			ShortCode:   existingLink.ShortCode,
+			OriginalURL: existingLink.OriginalURL,
+		})
+		return
+	}
 
 	var newLink db.Link
 	var err error
