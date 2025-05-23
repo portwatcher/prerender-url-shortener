@@ -77,11 +77,13 @@ func GenerateShortCodeHandler(c *gin.Context) {
 			// Check if it's currently being rendered in our queue
 			if renderer.GlobalRenderQueue.IsInProgress(req.URL) {
 				log.Printf("URL %s is already being rendered, waiting for completion", req.URL)
-				// Wait for up to 30 seconds for rendering to complete
-				if renderer.GlobalRenderQueue.WaitForRender(req.URL, 30*time.Second) {
+				// Wait for up to the configured timeout for rendering to complete
+				timeoutDuration := time.Duration(config.AppConfig.RenderTimeoutSeconds) * time.Second
+				if renderer.GlobalRenderQueue.WaitForRender(req.URL, timeoutDuration) {
 					// Fetch updated link after rendering
 					updatedLink, fetchErr := db.GetLinkByShortCode(existingLink.ShortCode)
 					if fetchErr == nil {
+						log.Printf("Existing URL rendering completed, returning ready short code to client")
 						c.JSON(http.StatusOK, GenerateResponse{
 							ShortCode:   updatedLink.ShortCode,
 							OriginalURL: updatedLink.OriginalURL,
@@ -90,11 +92,27 @@ func GenerateShortCodeHandler(c *gin.Context) {
 					}
 				}
 				// If waiting failed or timeout, just return the existing short code
-				log.Printf("Timeout waiting for render of %s, returning existing short code", req.URL)
+				log.Printf("Timeout waiting for render of %s, returning existing short code anyway", req.URL)
 			} else {
-				// Not currently in queue, re-queue for rendering
-				log.Printf("URL %s exists but not in render queue, re-queuing", req.URL)
+				// Not currently in queue, re-queue for rendering and wait
+				log.Printf("URL %s exists but not in render queue, re-queuing and waiting", req.URL)
 				renderer.GlobalRenderQueue.QueueRender(existingLink.ShortCode, req.URL)
+
+				// Wait for the re-queued rendering to complete
+				timeoutDuration := time.Duration(config.AppConfig.RenderTimeoutSeconds) * time.Second
+				if renderer.GlobalRenderQueue.WaitForRender(req.URL, timeoutDuration) {
+					// Fetch updated link after rendering
+					updatedLink, fetchErr := db.GetLinkByShortCode(existingLink.ShortCode)
+					if fetchErr == nil {
+						log.Printf("Re-queued URL rendering completed, returning ready short code to client")
+						c.JSON(http.StatusOK, GenerateResponse{
+							ShortCode:   updatedLink.ShortCode,
+							OriginalURL: updatedLink.OriginalURL,
+						})
+						return
+					}
+				}
+				log.Printf("Timeout waiting for re-queued render of %s, returning existing short code anyway", req.URL)
 			}
 
 			c.JSON(http.StatusOK, GenerateResponse{
@@ -165,7 +183,39 @@ func GenerateShortCodeHandler(c *gin.Context) {
 	// Queue for rendering
 	renderer.GlobalRenderQueue.QueueRender(generatedShortCode, req.URL)
 
-	// Return immediately with the short code
+	// Wait for rendering to complete before returning to client
+	log.Printf("Waiting for rendering to complete for %s before returning to client", generatedShortCode)
+
+	// Wait for up to the configured timeout for rendering to complete
+	timeoutDuration := time.Duration(config.AppConfig.RenderTimeoutSeconds) * time.Second
+	if renderer.GlobalRenderQueue.WaitForRender(req.URL, timeoutDuration) {
+		// Fetch updated link after rendering
+		updatedLink, fetchErr := db.GetLinkByShortCode(generatedShortCode)
+		if fetchErr == nil {
+			if updatedLink.RenderStatus == db.RenderStatusCompleted {
+				log.Printf("Rendering completed successfully for %s, returning ready short code to client", generatedShortCode)
+				c.JSON(http.StatusCreated, GenerateResponse{
+					ShortCode:   updatedLink.ShortCode,
+					OriginalURL: updatedLink.OriginalURL,
+				})
+				return
+			} else if updatedLink.RenderStatus == db.RenderStatusFailed {
+				log.Printf("Rendering failed for %s, but returning short code anyway", generatedShortCode)
+				c.JSON(http.StatusCreated, GenerateResponse{
+					ShortCode:   updatedLink.ShortCode,
+					OriginalURL: updatedLink.OriginalURL,
+				})
+				return
+			}
+		} else {
+			log.Printf("Error fetching updated link after render wait for %s: %v", generatedShortCode, fetchErr)
+		}
+	} else {
+		log.Printf("Timeout waiting for render completion of %s, returning short code anyway", generatedShortCode)
+	}
+
+	// Fallback: return the short code even if rendering didn't complete
+	// (This handles timeout cases or other issues)
 	c.JSON(http.StatusCreated, GenerateResponse{
 		ShortCode:   newLink.ShortCode,
 		OriginalURL: newLink.OriginalURL,
