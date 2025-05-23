@@ -23,23 +23,54 @@ The web server handles two main types of requests:
      ```
    - Triggers the backend process to generate a short code and prerender the content.
 
-### 2. Prerendering and Shortening Logic (Rod Integration)
+### 2. Prerendering and Shortening Logic (Rod Integration with Async Queue)
 
 When a URL is submitted via the `/generate` endpoint:
    - A unique `short-code` is generated for the given URL.
-   - The system checks if this `short-code` (or the original URL) is already cached/stored in the PostgreSQL database.
+   - The system checks if this URL is already cached/stored in the PostgreSQL database.
    - **If not cached:**
-     - The `rod` library is used to launch a headless browser instance.
-     - `rod` navigates to the original URL and renders its content, ensuring support for Single Page Applications (SPAs) by waiting for JavaScript execution to complete.
-     - The generated `short-code`, the JS-rendered HTML content, and the original URL are saved into the PostgreSQL database.
+     - The link is immediately saved to the database with a "pending" render status.
+     - The response is returned immediately with the short code.
+     - The URL is queued for background rendering using a worker pool.
+   - **If already exists:**
+     - If rendering is complete, returns the existing short code.
+     - If rendering is in progress, waits briefly and returns the existing short code.
+     - Prevents duplicate rendering of the same URL.
+   
+   **Background Rendering Process:**
+   - Configurable number of worker goroutines process the render queue.
+   - Each worker uses the `rod` library to launch a headless browser instance.
+   - `rod` navigates to the original URL and renders its content, ensuring support for Single Page Applications (SPAs).
+   - The rendered HTML content and status are updated in the database upon completion.
 
 ### 3. PostgreSQL Database
 
    - A PostgreSQL database is used to store the following information:
      - `short_code` (Primary Key)
-     - `original_url`
+     - `original_url` (Indexed for efficient lookups)
      - `rendered_html_content`
+     - `render_status` (pending, rendering, completed, failed)
      - Timestamps (e.g., `created_at`, `updated_at`)
+
+### 4. Additional Endpoints
+
+#### 4.1. `GET /health`
+   - Simple health check endpoint returning `{"status": "UP"}`
+
+#### 4.2. `GET /status`
+   - Detailed status endpoint including render queue information:
+     ```json
+     {
+       "status": "UP",
+       "render_queue": {
+         "worker_count": 3,
+         "queue_length": 2,
+         "in_progress_count": 1,
+         "in_progress_urls": ["https://example.com"],
+         "waiting_goroutines": 0
+       }
+     }
+     ```
 
 ## Technology Stack
 
@@ -72,6 +103,7 @@ DATABASE_URL="postgres://user:password@host:port/dbname?sslmode=disable"
 SERVER_PORT=":8080" # Optional, defaults to :8080
 ALLOWED_DOMAINS="example.com,another.org" # Optional, comma-separated, empty means allow all
 ROD_BIN_PATH="" # Optional, path to Chrome/Chromium binary if not in system PATH or for specific version
+RENDER_WORKER_COUNT="3" # Optional, number of background rendering workers, defaults to 3
 ```
 
 3.  **Install dependencies:**

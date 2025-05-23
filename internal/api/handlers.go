@@ -11,6 +11,7 @@ import (
 	"prerender-url-shortener/internal/shortener"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jinzhu/gorm"
@@ -28,8 +29,7 @@ type GenerateResponse struct {
 }
 
 // GenerateShortCodeHandler handles the creation of new short URLs.
-// It takes a URL, generates a short code, renders the page with Rod,
-// and saves it to the database.
+// It immediately saves the short code to the database and queues rendering.
 func GenerateShortCodeHandler(c *gin.Context) {
 	var req GenerateRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -57,20 +57,68 @@ func GenerateShortCodeHandler(c *gin.Context) {
 		}
 	}
 
-	// TODO: Check if URL already exists and return existing short code if so.
-	// This requires a way to efficiently query by OriginalURL.
-	// For now, we always generate a new one, which might lead to duplicates
-	// if the same URL is submitted multiple times.
+	// Check if URL already exists in database
+	existingLink, err := db.GetLinkByOriginalURL(req.URL)
+	if err == nil {
+		// URL already exists
+		log.Printf("URL %s already exists with short code %s (status: %s)", req.URL, existingLink.ShortCode, existingLink.RenderStatus)
 
-	var newLink db.Link
-	var err error
+		// If it's already completed or failed, return immediately
+		if existingLink.RenderStatus == db.RenderStatusCompleted || existingLink.RenderStatus == db.RenderStatusFailed {
+			c.JSON(http.StatusOK, GenerateResponse{
+				ShortCode:   existingLink.ShortCode,
+				OriginalURL: existingLink.OriginalURL,
+			})
+			return
+		}
+
+		// If it's pending or rendering, check if we should wait or queue a new render
+		if existingLink.RenderStatus == db.RenderStatusPending || existingLink.RenderStatus == db.RenderStatusRendering {
+			// Check if it's currently being rendered in our queue
+			if renderer.GlobalRenderQueue.IsInProgress(req.URL) {
+				log.Printf("URL %s is already being rendered, waiting for completion", req.URL)
+				// Wait for up to 30 seconds for rendering to complete
+				if renderer.GlobalRenderQueue.WaitForRender(req.URL, 30*time.Second) {
+					// Fetch updated link after rendering
+					updatedLink, fetchErr := db.GetLinkByShortCode(existingLink.ShortCode)
+					if fetchErr == nil {
+						c.JSON(http.StatusOK, GenerateResponse{
+							ShortCode:   updatedLink.ShortCode,
+							OriginalURL: updatedLink.OriginalURL,
+						})
+						return
+					}
+				}
+				// If waiting failed or timeout, just return the existing short code
+				log.Printf("Timeout waiting for render of %s, returning existing short code", req.URL)
+			} else {
+				// Not currently in queue, re-queue for rendering
+				log.Printf("URL %s exists but not in render queue, re-queuing", req.URL)
+				renderer.GlobalRenderQueue.QueueRender(existingLink.ShortCode, req.URL)
+			}
+
+			c.JSON(http.StatusOK, GenerateResponse{
+				ShortCode:   existingLink.ShortCode,
+				OriginalURL: existingLink.OriginalURL,
+			})
+			return
+		}
+	} else if !gorm.IsRecordNotFoundError(err) {
+		// Some other database error
+		log.Printf("Error checking existing URL %s: %v", req.URL, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error while checking existing URL"})
+		return
+	}
+
+	// Generate new short code
 	var generatedShortCode string
 
-	// Retry mechanism for short code generation in case of collision (though unlikely with 6 chars)
-	for i := range [5]struct{}{} { // Max 5 retries, modernized loop
-		generatedShortCode, err = shortener.GenerateShortCode()
-		if err != nil {
-			log.Printf("Error generating short code: %v", err)
+	// Retry mechanism for short code generation in case of collision
+	for i := range [5]struct{}{} { // Max 5 retries
+		var genErr error
+		generatedShortCode, genErr = shortener.GenerateShortCode()
+		if genErr != nil {
+			log.Printf("Error generating short code: %v", genErr)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate short code"})
 			return
 		}
@@ -98,25 +146,12 @@ func GenerateShortCodeHandler(c *gin.Context) {
 
 	log.Printf("Generated unique short code %s for URL: %s", generatedShortCode, req.URL)
 
-	// Render the page using Rod
-	// This can be a long operation, consider running it in a goroutine for production
-	// and returning a 202 Accepted immediately. For now, synchronous.
-	log.Printf("Starting Rod rendering for URL: %s", req.URL)
-	htmlContent, err := renderer.RenderPageWithRod(req.URL)
-	if err != nil {
-		log.Printf("Error rendering page with Rod for URL %s: %v", req.URL, err)
-		// Decide if we still want to save the link without prerendered content
-		// For now, we'll return an error and not save.
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to render page content: %v", err)})
-		return
-	}
-	log.Printf("Successfully rendered HTML for URL: %s (length: %d)", req.URL, len(htmlContent))
-
-	newLink = db.Link{
+	// Immediately save to database with pending status
+	newLink := db.Link{
 		ShortCode:           generatedShortCode,
 		OriginalURL:         req.URL,
-		RenderedHTMLContent: htmlContent,
-		// CreatedAt and UpdatedAt are handled by gorm.Model automatically
+		RenderedHTMLContent: "", // Empty initially
+		RenderStatus:        db.RenderStatusPending,
 	}
 
 	if err := db.CreateLink(&newLink); err != nil {
@@ -125,6 +160,12 @@ func GenerateShortCodeHandler(c *gin.Context) {
 		return
 	}
 
+	log.Printf("Saved link to database: %s -> %s (status: pending)", generatedShortCode, req.URL)
+
+	// Queue for rendering
+	renderer.GlobalRenderQueue.QueueRender(generatedShortCode, req.URL)
+
+	// Return immediately with the short code
 	c.JSON(http.StatusCreated, GenerateResponse{
 		ShortCode:   newLink.ShortCode,
 		OriginalURL: newLink.OriginalURL,
@@ -164,20 +205,51 @@ func RedirectHandler(c *gin.Context) {
 		strings.Contains(strings.ToLower(userAgent), "duckduckbot") ||
 		strings.Contains(strings.ToLower(userAgent), "baiduspider") ||
 		strings.Contains(strings.ToLower(userAgent), "yandexbot") ||
-		strings.Contains(strings.ToLower(userAgent), "facebot") || // Facebook
+		strings.Contains(strings.ToLower(userAgent), "facebook") || // Facebook (covers facebot and facebookexternalhit)
 		strings.Contains(strings.ToLower(userAgent), "twitterbot") ||
 		strings.Contains(strings.ToLower(userAgent), "linkedinbot")
 
 	if isBot {
-		log.Printf("Serving prerendered content for bot (UA: %s) for short code: %s", userAgent, shortCode)
-		if link.RenderedHTMLContent == "" {
-			// This case should ideally not happen if generation was successful
-			// but handle it just in case. Redirecting might be a better fallback.
-			log.Printf("Warning: Bot request for %s but no rendered HTML available. Redirecting instead.", shortCode)
+		log.Printf("Bot request (UA: %s) for short code: %s (render status: %s)", userAgent, shortCode, link.RenderStatus)
+
+		// Check render status
+		switch link.RenderStatus {
+		case db.RenderStatusCompleted:
+			if link.RenderedHTMLContent == "" {
+				log.Printf("Warning: Bot request for %s but no rendered HTML content despite completed status. Redirecting instead.", shortCode)
+				c.Redirect(http.StatusFound, link.OriginalURL)
+				return
+			}
+			c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(link.RenderedHTMLContent))
+
+		case db.RenderStatusPending, db.RenderStatusRendering:
+			// For bots, we can either wait a bit or redirect immediately
+			// Let's wait for a short time (5 seconds) for rendering to complete
+			log.Printf("Bot request for %s but rendering not complete (status: %s), waiting briefly", shortCode, link.RenderStatus)
+
+			// Wait for up to 5 seconds for rendering to complete
+			if renderer.GlobalRenderQueue.WaitForRender(link.OriginalURL, 5*time.Second) {
+				// Fetch updated link after rendering
+				updatedLink, fetchErr := db.GetLinkByShortCode(shortCode)
+				if fetchErr == nil && updatedLink.RenderStatus == db.RenderStatusCompleted && updatedLink.RenderedHTMLContent != "" {
+					log.Printf("Bot request: rendering completed during wait, serving HTML for %s", shortCode)
+					c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(updatedLink.RenderedHTMLContent))
+					return
+				}
+			}
+
+			// If waiting failed or rendering not complete, redirect instead
+			log.Printf("Bot request: rendering not ready for %s, redirecting instead", shortCode)
 			c.Redirect(http.StatusFound, link.OriginalURL)
-			return
+
+		case db.RenderStatusFailed:
+			log.Printf("Bot request for %s but rendering failed, redirecting instead", shortCode)
+			c.Redirect(http.StatusFound, link.OriginalURL)
+
+		default:
+			log.Printf("Bot request for %s with unknown render status %s, redirecting instead", shortCode, link.RenderStatus)
+			c.Redirect(http.StatusFound, link.OriginalURL)
 		}
-		c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(link.RenderedHTMLContent))
 	} else {
 		log.Printf("Redirecting user (UA: %s) for short code: %s to %s", userAgent, shortCode, link.OriginalURL)
 		c.Redirect(http.StatusFound, link.OriginalURL)
@@ -187,4 +259,16 @@ func RedirectHandler(c *gin.Context) {
 // HealthCheckHandler provides a simple health check endpoint.
 func HealthCheckHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "UP"})
+}
+
+// StatusHandler provides detailed system status including render queue information.
+func StatusHandler(c *gin.Context) {
+	queueStatus := renderer.GlobalRenderQueue.GetStatus()
+
+	status := gin.H{
+		"status":       "UP",
+		"render_queue": queueStatus,
+	}
+
+	c.JSON(http.StatusOK, status)
 }

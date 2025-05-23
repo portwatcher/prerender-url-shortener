@@ -11,6 +11,9 @@ func SetupRouter() *gin.Engine {
 	// Health check endpoint
 	r.GET("/health", HealthCheckHandler)
 
+	// Status endpoint with detailed information
+	r.GET("/status", StatusHandler)
+
 	// API v1 group (optional, but good practice)
 	// apiV1 := r.Group("/api/v1")
 	// {

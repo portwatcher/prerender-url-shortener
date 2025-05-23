@@ -2,9 +2,13 @@ package main
 
 import (
 	"log"
+	"os"
+	"os/signal"
 	"prerender-url-shortener/internal/api"
 	"prerender-url-shortener/internal/config"
 	"prerender-url-shortener/internal/db"
+	"prerender-url-shortener/internal/renderer"
+	"syscall"
 
 	_ "github.com/jinzhu/gorm/dialects/postgres" // PostgreSQL driver for GORM
 )
@@ -25,6 +29,20 @@ func main() {
 	}
 	defer db.DB.Close()
 	log.Println("Database connection successful and schema migrated.")
+
+	// Initialize render queue with configurable worker count
+	workerCount := config.AppConfig.RenderWorkerCount
+	renderer.InitRenderQueue(workerCount)
+
+	// Setup graceful shutdown
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-c
+		log.Println("Shutting down gracefully...")
+		renderer.GlobalRenderQueue.Shutdown()
+		os.Exit(0)
+	}()
 
 	// Setup router
 	router := api.SetupRouter()
