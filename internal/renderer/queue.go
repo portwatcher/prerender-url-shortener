@@ -193,7 +193,7 @@ func (rq *RenderQueue) IsInProgress(originalURL string) bool {
 }
 
 // GetStatus returns the current status of the render queue
-func (rq *RenderQueue) GetStatus() map[string]interface{} {
+func (rq *RenderQueue) GetStatus() map[string]any {
 	rq.mutex.RLock()
 	defer rq.mutex.RUnlock()
 
@@ -207,7 +207,7 @@ func (rq *RenderQueue) GetStatus() map[string]interface{} {
 		waitingCount += len(waiters)
 	}
 
-	return map[string]interface{}{
+	return map[string]any{
 		"worker_count":       rq.workerCount,
 		"queue_length":       len(rq.jobs),
 		"in_progress_count":  len(rq.inProgress),

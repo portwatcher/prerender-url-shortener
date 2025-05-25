@@ -73,7 +73,7 @@ func UpdateLinkRenderStatus(shortCode string, status RenderStatus) error {
 
 // UpdateLinkContent updates the rendered HTML content and status of a link.
 func UpdateLinkContent(shortCode string, htmlContent string, status RenderStatus) error {
-	return DB.Model(&Link{}).Where("short_code = ?", shortCode).Updates(map[string]interface{}{
+	return DB.Model(&Link{}).Where("short_code = ?", shortCode).Updates(map[string]any{
 		"rendered_html_content": htmlContent,
 		"render_status":         status,
 	}).Error

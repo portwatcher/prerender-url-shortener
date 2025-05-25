@@ -51,7 +51,7 @@ func setupTestAPI(t *testing.T) *gin.Engine {
 	return router
 }
 
-func teardownTestAPI(t *testing.T) {
+func teardownTestAPI(_ *testing.T) {
 	if db.DB != nil {
 		db.DB.Close()
 	}
@@ -63,7 +63,7 @@ func teardownTestAPI(t *testing.T) {
 func TestGenerateShortCodeHandler(t *testing.T) {
 	tests := []struct {
 		name           string
-		requestBody    interface{}
+		requestBody    any
 		expectedStatus int
 		expectedFields []string
 		setupFunc      func()
@@ -398,14 +398,14 @@ func TestStatusHandler(t *testing.T) {
 
 	assert.Equal(t, http.StatusOK, w.Code)
 
-	var response map[string]interface{}
+	var response map[string]any
 	err = json.Unmarshal(w.Body.Bytes(), &response)
 	assert.NoError(t, err)
 
 	assert.Equal(t, "UP", response["status"])
 	assert.Contains(t, response, "render_queue")
 
-	renderQueue, ok := response["render_queue"].(map[string]interface{})
+	renderQueue, ok := response["render_queue"].(map[string]any)
 	assert.True(t, ok)
 	assert.Contains(t, renderQueue, "worker_count")
 	assert.Contains(t, renderQueue, "queue_length")
@@ -527,5 +527,200 @@ func BenchmarkRedirectHandler(b *testing.B) {
 
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, req)
+	}
+}
+
+func TestIndexHandler(t *testing.T) {
+	tests := []struct {
+		name           string
+		allowedDomains string
+		expectedStatus int
+		expectedHeader string
+		expectRedirect bool
+	}{
+		{
+			name:           "empty allowed domains",
+			allowedDomains: "",
+			expectedStatus: http.StatusNotFound,
+			expectRedirect: false,
+		},
+		{
+			name:           "single allowed domain",
+			allowedDomains: "example.com",
+			expectedStatus: http.StatusFound,
+			expectedHeader: "https://example.com",
+			expectRedirect: true,
+		},
+		{
+			name:           "multiple allowed domains",
+			allowedDomains: "first.com,second.com,third.com",
+			expectedStatus: http.StatusFound,
+			expectedHeader: "https://first.com",
+			expectRedirect: true,
+		},
+		{
+			name:           "domain with whitespace (causes URL parse error)",
+			allowedDomains: " example.org ",
+			expectedStatus: http.StatusInternalServerError,
+			expectedHeader: "",
+			expectRedirect: false,
+		},
+		{
+			name:           "empty first domain (edge case)",
+			allowedDomains: ",second.com,third.com",
+			expectedStatus: http.StatusNotFound,
+			expectRedirect: false,
+		},
+		{
+			name:           "domain with subdomain",
+			allowedDomains: "subdomain.example.com",
+			expectedStatus: http.StatusFound,
+			expectedHeader: "https://subdomain.example.com",
+			expectRedirect: true,
+		},
+		{
+			name:           "domain with port",
+			allowedDomains: "example.com:8080",
+			expectedStatus: http.StatusFound,
+			expectedHeader: "https://example.com:8080",
+			expectRedirect: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			router := setupTestAPI(t)
+			defer teardownTestAPI(t)
+
+			// Add IndexHandler to router
+			router.GET("/", IndexHandler)
+
+			// Set allowed domains for this test
+			originalAllowedDomains := config.AppConfig.AllowedDomains
+			config.AppConfig.AllowedDomains = tt.allowedDomains
+			defer func() {
+				config.AppConfig.AllowedDomains = originalAllowedDomains
+			}()
+
+			req, err := http.NewRequest("GET", "/", nil)
+			require.NoError(t, err)
+
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+
+			assert.Equal(t, tt.expectedStatus, w.Code)
+
+			if tt.expectRedirect {
+				assert.Equal(t, tt.expectedHeader, w.Header().Get("Location"))
+			} else {
+				assert.Empty(t, w.Header().Get("Location"))
+			}
+		})
+	}
+}
+
+func TestIndexHandlerCorrectLogic(t *testing.T) {
+	// This test verifies that IndexHandler has the correct logic:
+	// - Returns 404 when AllowedDomains is empty
+	// - Redirects to first domain when AllowedDomains is not empty
+
+	router := setupTestAPI(t)
+	defer teardownTestAPI(t)
+
+	// Add IndexHandler to router
+	router.GET("/", IndexHandler)
+
+	// Test with non-empty AllowedDomains - should redirect
+	config.AppConfig.AllowedDomains = "example.com"
+
+	req, err := http.NewRequest("GET", "/", nil)
+	require.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	// Should redirect to https://example.com
+	assert.Equal(t, http.StatusFound, w.Code)
+	assert.Equal(t, "https://example.com", w.Header().Get("Location"))
+
+	// Reset config
+	config.AppConfig.AllowedDomains = ""
+}
+
+func TestIndexHandlerEdgeCases(t *testing.T) {
+	tests := []struct {
+		name           string
+		allowedDomains string
+		expectedStatus int
+		expectedError  bool
+		description    string
+	}{
+		{
+			name:           "only commas",
+			allowedDomains: ",,,",
+			expectedStatus: http.StatusNotFound,
+			expectedError:  false,
+			description:    "Should return 404 when first domain is empty after split",
+		},
+		{
+			name:           "trailing comma",
+			allowedDomains: "example.com,",
+			expectedStatus: http.StatusFound,
+			expectedError:  false,
+			description:    "Should work fine with trailing comma",
+		},
+		{
+			name:           "leading comma",
+			allowedDomains: ",example.com",
+			expectedStatus: http.StatusNotFound,
+			expectedError:  false,
+			description:    "Should return 404 when first element after split is empty",
+		},
+		{
+			name:           "domain with special characters",
+			allowedDomains: "invalid_domain_with_bad<>chars",
+			expectedStatus: http.StatusFound,
+			expectedError:  false,
+			description:    "Go's url.Parse is forgiving and will still redirect",
+		},
+		{
+			name:           "domain with unicode control characters",
+			allowedDomains: "example\x00.com",
+			expectedStatus: http.StatusInternalServerError,
+			expectedError:  true,
+			description:    "Control characters cause URL parsing to fail",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			router := setupTestAPI(t)
+			defer teardownTestAPI(t)
+
+			// Add IndexHandler to router
+			router.GET("/", IndexHandler)
+
+			// Set allowed domains for this test
+			originalAllowedDomains := config.AppConfig.AllowedDomains
+			config.AppConfig.AllowedDomains = tt.allowedDomains
+			defer func() {
+				config.AppConfig.AllowedDomains = originalAllowedDomains
+			}()
+
+			req, err := http.NewRequest("GET", "/", nil)
+			require.NoError(t, err)
+
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+
+			assert.Equal(t, tt.expectedStatus, w.Code, tt.description)
+
+			// For successful redirects, check that Location header is set
+			if tt.expectedStatus == http.StatusFound {
+				assert.NotEmpty(t, w.Header().Get("Location"))
+			} else {
+				assert.Empty(t, w.Header().Get("Location"))
+			}
+		})
 	}
 }

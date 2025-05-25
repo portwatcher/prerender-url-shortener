@@ -322,3 +322,28 @@ func StatusHandler(c *gin.Context) {
 
 	c.JSON(http.StatusOK, status)
 }
+
+// IndexHandler handles requests to the root path (/) by redirecting to the first allowed domain.
+// If no allowed domains are configured, it returns a 404 Not Found status.
+// If URL parsing fails (e.g., due to invalid characters), it returns a 500 Internal Server Error.
+func IndexHandler(c *gin.Context) {
+
+	if config.AppConfig.AllowedDomains == "" {
+		c.Status(http.StatusNotFound)
+		return
+	}
+
+	firstDomain := strings.Split(config.AppConfig.AllowedDomains, ",")[0]
+	if firstDomain == "" {
+		c.Status(http.StatusNotFound)
+		return
+	}
+
+	url, err := url.Parse(fmt.Sprintf("https://%s", firstDomain))
+	if err != nil {
+		c.Status(http.StatusInternalServerError)
+		return
+	}
+
+	c.Redirect(http.StatusFound, url.String())
+}

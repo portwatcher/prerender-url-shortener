@@ -17,6 +17,8 @@ func SetupRouter() *gin.Engine {
 	// config.AllowHeaders = []string{"Origin", "Content-Length", "Content-Type", "Authorization"}
 	r.Use(cors.New(config))
 
+	r.GET("/", IndexHandler)
+
 	// Health check endpoint
 	r.GET("/health", HealthCheckHandler)
 
