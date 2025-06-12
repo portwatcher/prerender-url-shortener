@@ -25,8 +25,8 @@ The web server handles two main types of requests:
        "url": "string"
      }
      ```
-   - **Returns 202 Accepted** for async rendering in most cases.
-   - Only returns 200 OK if the URL is already cached and has valid Open Graph image metadata.
+   - **Always returns 202 Accepted** for async rendering.
+   - Never returns 200 OK - ensures consistent async behavior.
    - Triggers the backend process to generate a short code and prerender the content asynchronously.
 
 ### 2. Prerendering and Shortening Logic (Rod Integration with Async Queue)
@@ -35,9 +35,8 @@ When a URL is submitted via the `/generate` endpoint:
    - A unique `short-code` is generated for the given URL.
    - The system checks if this URL is already cached/stored in the PostgreSQL database.
    - **If cached and rendering complete:**
-     - Checks if the rendered HTML contains an Open Graph image meta tag (`<meta name="og:image"` or `<meta property="og:image"`).
-     - If valid og:image tag exists, returns 200 OK with the existing short code.
-     - If no og:image tag, returns 202 Accepted and re-queues for rendering.
+     - Always returns 202 Accepted and re-queues for fresh rendering.
+     - Ensures content freshness and consistent async behavior.
    - **If not cached:**
      - The link is immediately saved to the database with a "pending" render status.
      - Returns 202 Accepted with the short code.

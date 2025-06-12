@@ -82,31 +82,22 @@ func GenerateShortCodeHandler(c *gin.Context) {
 		// Check current render status
 		switch existingLink.RenderStatus {
 		case db.RenderStatusCompleted:
-			// Check if HTML has og:image tag
-			if hasOGImageTag(existingLink.RenderedHTMLContent) {
-				log.Printf("URL %s has valid og:image tag, returning existing short code", req.URL)
-				c.JSON(http.StatusOK, GenerateResponse{
-					ShortCode:   existingLink.ShortCode,
-					OriginalURL: existingLink.OriginalURL,
-				})
-				return
-			} else {
-				// No og:image tag, re-render
-				log.Printf("URL %s missing og:image tag, re-queuing for render", req.URL)
+			// Always return 202 Accepted and trigger re-render to ensure freshness
+			// Only bots will get the actual HTML if it has valid og:image tag
+			log.Printf("URL %s exists with completed status, re-queuing for fresh render and returning 202", req.URL)
 
-				// Update status to pending and queue for re-rendering
-				if updateErr := db.UpdateLinkRenderStatus(existingLink.ShortCode, db.RenderStatusPending); updateErr != nil {
-					log.Printf("Error updating status to pending for re-render %s: %v", existingLink.ShortCode, updateErr)
-				}
-
-				renderer.GlobalRenderQueue.QueueRender(existingLink.ShortCode, req.URL)
-
-				c.JSON(http.StatusAccepted, GenerateResponse{
-					ShortCode:   existingLink.ShortCode,
-					OriginalURL: existingLink.OriginalURL,
-				})
-				return
+			// Update status to pending and queue for re-rendering
+			if updateErr := db.UpdateLinkRenderStatus(existingLink.ShortCode, db.RenderStatusPending); updateErr != nil {
+				log.Printf("Error updating status to pending for re-render %s: %v", existingLink.ShortCode, updateErr)
 			}
+
+			renderer.GlobalRenderQueue.QueueRender(existingLink.ShortCode, req.URL)
+
+			c.JSON(http.StatusAccepted, GenerateResponse{
+				ShortCode:   existingLink.ShortCode,
+				OriginalURL: existingLink.OriginalURL,
+			})
+			return
 
 		case db.RenderStatusPending, db.RenderStatusRendering:
 			// Already being rendered
