@@ -9,6 +9,15 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// Mock database functions for testing
+func mockUpdateLinkRenderStatus(shortCode, status string) error {
+	return nil
+}
+
+func mockUpdateLinkContent(shortCode, content, status string) error {
+	return nil
+}
+
 // Mock renderer function for testing
 func mockRenderPageWithRod(url string) (string, error) {
 	// Simulate some work
@@ -32,7 +41,6 @@ func TestInitRenderQueue(t *testing.T) {
 			queue := &RenderQueue{
 				jobs:        make(chan RenderJob, 100),
 				inProgress:  make(map[string]bool),
-				waiting:     make(map[string][]chan bool),
 				workerCount: tt.workerCount,
 			}
 
@@ -44,7 +52,6 @@ func TestInitRenderQueue(t *testing.T) {
 			assert.Equal(t, tt.workerCount, queue.workerCount)
 			assert.NotNil(t, queue.jobs)
 			assert.NotNil(t, queue.inProgress)
-			assert.NotNil(t, queue.waiting)
 
 			// Clean up
 			close(queue.jobs)
@@ -56,7 +63,6 @@ func TestQueueRender(t *testing.T) {
 	queue := &RenderQueue{
 		jobs:        make(chan RenderJob, 10),
 		inProgress:  make(map[string]bool),
-		waiting:     make(map[string][]chan bool),
 		workerCount: 1,
 	}
 
@@ -109,7 +115,6 @@ func TestIsInProgress(t *testing.T) {
 	queue := &RenderQueue{
 		jobs:        make(chan RenderJob, 10),
 		inProgress:  make(map[string]bool),
-		waiting:     make(map[string][]chan bool),
 		workerCount: 1,
 	}
 
@@ -133,76 +138,10 @@ func TestIsInProgress(t *testing.T) {
 	assert.False(t, queue.IsInProgress(testURL))
 }
 
-func TestWaitForRender(t *testing.T) {
-	queue := &RenderQueue{
-		jobs:        make(chan RenderJob, 10),
-		inProgress:  make(map[string]bool),
-		waiting:     make(map[string][]chan bool),
-		workerCount: 1,
-	}
-
-	testURL := "https://waittest.com"
-
-	t.Run("not in progress", func(t *testing.T) {
-		result := queue.WaitForRender(testURL, 100*time.Millisecond)
-		assert.False(t, result)
-	})
-
-	t.Run("timeout while waiting", func(t *testing.T) {
-		// Mark as in progress
-		queue.mutex.Lock()
-		queue.inProgress[testURL] = true
-		queue.mutex.Unlock()
-
-		start := time.Now()
-		result := queue.WaitForRender(testURL, 50*time.Millisecond)
-		elapsed := time.Since(start)
-
-		assert.False(t, result)
-		assert.True(t, elapsed >= 50*time.Millisecond)
-		assert.True(t, elapsed < 100*time.Millisecond)
-	})
-
-	t.Run("wait completes successfully", func(t *testing.T) {
-		testURL2 := "https://waittest2.com"
-
-		// Mark as in progress
-		queue.mutex.Lock()
-		queue.inProgress[testURL2] = true
-		queue.mutex.Unlock()
-
-		// Start waiting in a goroutine
-		var wg sync.WaitGroup
-		var result bool
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			result = queue.WaitForRender(testURL2, 1*time.Second)
-		}()
-
-		// Wait a bit, then simulate completion
-		time.Sleep(10 * time.Millisecond)
-		queue.mutex.Lock()
-		waiters := queue.waiting[testURL2]
-		if len(waiters) > 0 {
-			for _, waiter := range waiters {
-				waiter <- true
-			}
-			delete(queue.waiting, testURL2)
-		}
-		delete(queue.inProgress, testURL2)
-		queue.mutex.Unlock()
-
-		wg.Wait()
-		assert.True(t, result)
-	})
-}
-
 func TestGetStatus(t *testing.T) {
 	queue := &RenderQueue{
 		jobs:        make(chan RenderJob, 10),
 		inProgress:  make(map[string]bool),
-		waiting:     make(map[string][]chan bool),
 		workerCount: 3,
 	}
 
@@ -213,14 +152,11 @@ func TestGetStatus(t *testing.T) {
 	queue.inProgress["https://inprogress1.com"] = true
 	queue.inProgress["https://inprogress2.com"] = true
 
-	queue.waiting["https://waiting.com"] = make([]chan bool, 2)
-
 	status := queue.GetStatus()
 
 	assert.Equal(t, 3, status["worker_count"])
 	assert.Equal(t, 2, status["queue_length"])
 	assert.Equal(t, 2, status["in_progress_count"])
-	assert.Equal(t, 2, status["waiting_goroutines"])
 
 	inProgressURLs, ok := status["in_progress_urls"].([]string)
 	assert.True(t, ok)
@@ -246,7 +182,6 @@ func TestConcurrentQueueOperations(t *testing.T) {
 	queue := &RenderQueue{
 		jobs:        make(chan RenderJob, 100),
 		inProgress:  make(map[string]bool),
-		waiting:     make(map[string][]chan bool),
 		workerCount: 5,
 	}
 
@@ -288,7 +223,6 @@ func TestQueueCapacity(t *testing.T) {
 	queue := &RenderQueue{
 		jobs:        make(chan RenderJob, 2), // Small capacity
 		inProgress:  make(map[string]bool),
-		waiting:     make(map[string][]chan bool),
 		workerCount: 1,
 	}
 
@@ -310,11 +244,31 @@ func TestQueueCapacity(t *testing.T) {
 	close(queue.jobs)
 }
 
+func TestQueueRenderDuplicateURLs(t *testing.T) {
+	queue := &RenderQueue{
+		jobs:        make(chan RenderJob, 10),
+		inProgress:  make(map[string]bool),
+		workerCount: 1,
+	}
+
+	// Queue the same URL multiple times
+	url := "https://duplicate.com"
+	queue.QueueRender("CODE1", url)
+	queue.QueueRender("CODE2", url) // Should be skipped
+	queue.QueueRender("CODE3", url) // Should be skipped
+
+	// Only one job should be queued
+	assert.Equal(t, 1, len(queue.jobs))
+	assert.True(t, queue.IsInProgress(url))
+
+	// Clean up
+	close(queue.jobs)
+}
+
 func BenchmarkQueueRender(b *testing.B) {
 	queue := &RenderQueue{
 		jobs:        make(chan RenderJob, 1000),
 		inProgress:  make(map[string]bool),
-		waiting:     make(map[string][]chan bool),
 		workerCount: 1,
 	}
 
@@ -332,7 +286,6 @@ func BenchmarkIsInProgress(b *testing.B) {
 	queue := &RenderQueue{
 		jobs:        make(chan RenderJob, 100),
 		inProgress:  make(map[string]bool),
-		waiting:     make(map[string][]chan bool),
 		workerCount: 1,
 	}
 

@@ -12,7 +12,11 @@ The web server handles two main types of requests:
    - Retrieves a record from the database associated with the provided `<short-code>`.
    - **User Agent (UA) Detection:**
      - If the UA indicates a regular user browser, the server issues a redirect to the original URL.
-     - If the UA indicates a bot or crawler, the server returns the pre-rendered HTML content of the original URL.
+     - If the UA indicates a bot or crawler:
+       - **Returns pre-rendered HTML** only if rendering is complete AND contains valid Open Graph image metadata
+       - **Returns 404 Not Found** if content is not ready, rendering failed, or missing og:image tag
+       - **Auto-triggers re-rendering** when 404 is due to missing og:image tag in completed content
+       - **Never redirects bots** - they only get valid HTML or 404
 
 #### 1.2. `POST /generate`
    - Accepts a JSON request body with the following structure:
@@ -21,21 +25,26 @@ The web server handles two main types of requests:
        "url": "string"
      }
      ```
-   - Triggers the backend process to generate a short code and prerender the content.
+   - **Returns 202 Accepted** for async rendering in most cases.
+   - Only returns 200 OK if the URL is already cached and has valid Open Graph image metadata.
+   - Triggers the backend process to generate a short code and prerender the content asynchronously.
 
 ### 2. Prerendering and Shortening Logic (Rod Integration with Async Queue)
 
 When a URL is submitted via the `/generate` endpoint:
    - A unique `short-code` is generated for the given URL.
    - The system checks if this URL is already cached/stored in the PostgreSQL database.
+   - **If cached and rendering complete:**
+     - Checks if the rendered HTML contains an Open Graph image meta tag (`<meta name="og:image"` or `<meta property="og:image"`).
+     - If valid og:image tag exists, returns 200 OK with the existing short code.
+     - If no og:image tag, returns 202 Accepted and re-queues for rendering.
    - **If not cached:**
      - The link is immediately saved to the database with a "pending" render status.
-     - The response is returned immediately with the short code.
+     - Returns 202 Accepted with the short code.
      - The URL is queued for background rendering using a worker pool.
-   - **If already exists:**
-     - If rendering is complete, returns the existing short code.
-     - If rendering is in progress, waits briefly and returns the existing short code.
-     - Prevents duplicate rendering of the same URL.
+   - **If already being rendered:**
+     - Returns 202 Accepted with the existing short code.
+     - Prevents duplicate rendering of the same URL using URL as the task key.
    
    **Background Rendering Process:**
    - Configurable number of worker goroutines process the render queue.
@@ -66,8 +75,7 @@ When a URL is submitted via the `/generate` endpoint:
          "worker_count": 3,
          "queue_length": 2,
          "in_progress_count": 1,
-         "in_progress_urls": ["https://example.com"],
-         "waiting_goroutines": 0
+         "in_progress_urls": ["https://example.com"]
        }
      }
      ```

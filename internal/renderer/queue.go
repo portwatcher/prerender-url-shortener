@@ -14,10 +14,10 @@ type RenderJob struct {
 }
 
 // RenderQueue manages the rendering queue and prevents duplicate work
+// Uses URL as the primary key for tracking tasks
 type RenderQueue struct {
 	jobs        chan RenderJob
-	inProgress  map[string]bool        // Track URLs currently being rendered
-	waiting     map[string][]chan bool // Track goroutines waiting for specific URLs
+	inProgress  map[string]bool // Track URLs currently being rendered (URL as key)
 	mutex       sync.RWMutex
 	workerCount int
 }
@@ -29,7 +29,6 @@ func InitRenderQueue(workerCount int) {
 	GlobalRenderQueue = &RenderQueue{
 		jobs:        make(chan RenderJob, 100), // Buffer for 100 jobs
 		inProgress:  make(map[string]bool),
-		waiting:     make(map[string][]chan bool),
 		workerCount: workerCount,
 	}
 
@@ -41,7 +40,7 @@ func InitRenderQueue(workerCount int) {
 	log.Printf("Initialized render queue with %d workers", workerCount)
 }
 
-// QueueRender adds a job to the rendering queue or waits if already in progress
+// QueueRender adds a job to the rendering queue if not already in progress
 func (rq *RenderQueue) QueueRender(shortCode, originalURL string) {
 	rq.mutex.Lock()
 	defer rq.mutex.Unlock()
@@ -70,47 +69,11 @@ func (rq *RenderQueue) QueueRender(shortCode, originalURL string) {
 	}
 }
 
-// WaitForRender waits for a URL to be rendered if it's already in progress
-func (rq *RenderQueue) WaitForRender(originalURL string, timeout time.Duration) bool {
-	log.Printf("Queue: Checking if should wait for URL: %s (timeout: %v)", originalURL, timeout)
-
-	rq.mutex.Lock()
-
-	// If not in progress, return immediately
-	if !rq.inProgress[originalURL] {
-		rq.mutex.Unlock()
-		log.Printf("Queue: URL %s is not in progress, no need to wait", originalURL)
-		return false
-	}
-
-	// Create a channel to wait on
-	waitChan := make(chan bool, 1)
-	rq.waiting[originalURL] = append(rq.waiting[originalURL], waitChan)
-	currentWaiters := len(rq.waiting[originalURL])
-	rq.mutex.Unlock()
-
-	log.Printf("Queue: Added to waiting list for URL %s (total waiters: %d), starting wait...", originalURL, currentWaiters)
-
-	// Wait for completion or timeout
-	select {
-	case <-waitChan:
-		log.Printf("Queue: Wait completed successfully for URL: %s", originalURL)
-		return true
-	case <-time.After(timeout):
-		log.Printf("Queue: Wait timeout after %v for URL: %s, cleaning up", timeout, originalURL)
-		// Remove ourselves from the waiting list
-		rq.mutex.Lock()
-		waiters := rq.waiting[originalURL]
-		for i, ch := range waiters {
-			if ch == waitChan {
-				rq.waiting[originalURL] = append(waiters[:i], waiters[i+1:]...)
-				log.Printf("Queue: Removed timed-out waiter from list for URL: %s", originalURL)
-				break
-			}
-		}
-		rq.mutex.Unlock()
-		return false
-	}
+// IsInProgress checks if a URL is currently being rendered
+func (rq *RenderQueue) IsInProgress(originalURL string) bool {
+	rq.mutex.RLock()
+	defer rq.mutex.RUnlock()
+	return rq.inProgress[originalURL]
 }
 
 // worker processes rendering jobs
@@ -157,21 +120,6 @@ func (rq *RenderQueue) worker(id int) {
 			}
 		}
 
-		// Notify waiting goroutines
-		waiters := rq.waiting[job.OriginalURL]
-		if len(waiters) > 0 {
-			log.Printf("Worker %d: Notifying %d waiting goroutines for URL %s", id, len(waiters), job.OriginalURL)
-			for i, waitChan := range waiters {
-				select {
-				case waitChan <- true:
-					log.Printf("Worker %d: Notified waiter %d for URL %s", id, i+1, job.OriginalURL)
-				default:
-					log.Printf("Worker %d: Failed to notify waiter %d for URL %s (channel full)", id, i+1, job.OriginalURL)
-				}
-			}
-		}
-		delete(rq.waiting, job.OriginalURL)
-
 		// Mark as no longer in progress
 		delete(rq.inProgress, job.OriginalURL)
 		log.Printf("Worker %d: Marked URL %s as no longer in progress", id, job.OriginalURL)
@@ -185,13 +133,6 @@ func (rq *RenderQueue) worker(id int) {
 	log.Printf("Render worker %d stopped (jobs channel closed)", id)
 }
 
-// IsInProgress checks if a URL is currently being rendered
-func (rq *RenderQueue) IsInProgress(originalURL string) bool {
-	rq.mutex.RLock()
-	defer rq.mutex.RUnlock()
-	return rq.inProgress[originalURL]
-}
-
 // GetStatus returns the current status of the render queue
 func (rq *RenderQueue) GetStatus() map[string]any {
 	rq.mutex.RLock()
@@ -202,17 +143,11 @@ func (rq *RenderQueue) GetStatus() map[string]any {
 		inProgressURLs = append(inProgressURLs, url)
 	}
 
-	waitingCount := 0
-	for _, waiters := range rq.waiting {
-		waitingCount += len(waiters)
-	}
-
 	return map[string]any{
-		"worker_count":       rq.workerCount,
-		"queue_length":       len(rq.jobs),
-		"in_progress_count":  len(rq.inProgress),
-		"in_progress_urls":   inProgressURLs,
-		"waiting_goroutines": waitingCount,
+		"worker_count":      rq.workerCount,
+		"queue_length":      len(rq.jobs),
+		"in_progress_count": len(rq.inProgress),
+		"in_progress_urls":  inProgressURLs,
 	}
 }
 
