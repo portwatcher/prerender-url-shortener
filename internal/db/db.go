@@ -78,3 +78,12 @@ func UpdateLinkContent(shortCode string, htmlContent string, status RenderStatus
 		"render_status":         status,
 	}).Error
 }
+
+// ResetStuckRenderingTasks finds all links stuck in rendering status and resets them to pending
+func ResetStuckRenderingTasks() (int64, error) {
+	result := DB.Model(&Link{}).
+		Where("render_status = ?", RenderStatusRendering).
+		Update("render_status", RenderStatusPending)
+
+	return result.RowsAffected, result.Error
+}

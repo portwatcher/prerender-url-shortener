@@ -328,3 +328,77 @@ func TestLinkModel(t *testing.T) {
 	assert.Equal(t, link.RenderedHTMLContent, retrieved.RenderedHTMLContent)
 	assert.Equal(t, link.RenderStatus, retrieved.RenderStatus)
 }
+
+func TestResetStuckRenderingTasks(t *testing.T) {
+	setupTestDB(t)
+	defer teardownTestDB(t)
+
+	// Create test data with various render statuses
+	testLinks := []Link{
+		{
+			ShortCode:    "STUCK1",
+			OriginalURL:  "https://stuck1.com",
+			RenderStatus: RenderStatusRendering, // This should be reset
+		},
+		{
+			ShortCode:    "STUCK2",
+			OriginalURL:  "https://stuck2.com",
+			RenderStatus: RenderStatusRendering, // This should be reset
+		},
+		{
+			ShortCode:    "COMPLETE1",
+			OriginalURL:  "https://complete1.com",
+			RenderStatus: RenderStatusCompleted, // This should not be affected
+		},
+		{
+			ShortCode:    "PENDING1",
+			OriginalURL:  "https://pending1.com",
+			RenderStatus: RenderStatusPending, // This should not be affected
+		},
+		{
+			ShortCode:    "FAILED1",
+			OriginalURL:  "https://failed1.com",
+			RenderStatus: RenderStatusFailed, // This should not be affected
+		},
+	}
+
+	// Insert test data
+	for _, link := range testLinks {
+		err := CreateLink(&link)
+		require.NoError(t, err)
+	}
+
+	// Test resetting stuck tasks
+	affected, err := ResetStuckRenderingTasks()
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), affected, "Should have reset exactly 2 stuck tasks")
+
+	// Verify the results
+	for _, link := range testLinks {
+		updatedLink, err := GetLinkByShortCode(link.ShortCode)
+		require.NoError(t, err)
+
+		switch link.ShortCode {
+		case "STUCK1", "STUCK2":
+			// These should have been reset to pending
+			assert.Equal(t, RenderStatusPending, updatedLink.RenderStatus,
+				"Stuck task %s should have been reset to pending", link.ShortCode)
+		default:
+			// These should remain unchanged
+			assert.Equal(t, link.RenderStatus, updatedLink.RenderStatus,
+				"Non-stuck task %s should have remained unchanged", link.ShortCode)
+		}
+	}
+
+	// Test resetting when no stuck tasks exist
+	affected, err = ResetStuckRenderingTasks()
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), affected, "Should have found no stuck tasks to reset")
+
+	// Test with empty database
+	teardownTestDB(t)
+	setupTestDB(t)
+	affected, err = ResetStuckRenderingTasks()
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), affected, "Should handle empty database gracefully")
+}

@@ -34,6 +34,25 @@ func main() {
 	workerCount := config.AppConfig.RenderWorkerCount
 	renderer.InitRenderQueue(workerCount)
 
+	// Reset any stuck rendering tasks from previous crashes
+	affected, err := db.ResetStuckRenderingTasks()
+	if err != nil {
+		log.Printf("Warning: Failed to reset stuck rendering tasks: %v", err)
+	} else if affected > 0 {
+		log.Printf("Reset %d stuck rendering tasks to pending status", affected)
+
+		// Re-queue the reset tasks for rendering
+		var stuckLinks []db.Link
+		if err := db.DB.Where("render_status = ?", db.RenderStatusPending).Find(&stuckLinks).Error; err != nil {
+			log.Printf("Warning: Failed to fetch reset tasks for re-queuing: %v", err)
+		} else {
+			for _, link := range stuckLinks {
+				renderer.GlobalRenderQueue.QueueRender(link.ShortCode, link.OriginalURL)
+				log.Printf("Re-queued reset task for URL: %s (short code: %s)", link.OriginalURL, link.ShortCode)
+			}
+		}
+	}
+
 	// Setup graceful shutdown
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
