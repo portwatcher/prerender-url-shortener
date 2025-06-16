@@ -39,6 +39,23 @@ func (m *mockDB) UpdateLinkContent(shortCode string, content string, status db.R
 	return nil
 }
 
+func (m *mockDB) GetPendingTasks(limit int) ([]db.Link, error) {
+	var pendingLinks []db.Link
+	for shortCode, status := range mockDBStatus {
+		if status == db.RenderStatusPending {
+			pendingLinks = append(pendingLinks, db.Link{
+				ShortCode:    shortCode,
+				OriginalURL:  "https://example.com/" + shortCode,
+				RenderStatus: status,
+			})
+			if len(pendingLinks) >= limit {
+				break
+			}
+		}
+	}
+	return pendingLinks, nil
+}
+
 // Reset mock database state
 func resetMockDB() {
 	mockDBStatus = make(map[string]db.RenderStatus)
@@ -455,4 +472,139 @@ func TestQueueRenderWithDatabaseStatus(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPeriodicTaskChecker(t *testing.T) {
+	// Reset mock DB state
+	resetMockDB()
+
+	queue := &RenderQueue{
+		jobs:        make(chan RenderJob, 10),
+		inProgress:  make(map[string]bool),
+		workerCount: 1,
+		db:          &mockDB{},
+	}
+
+	// Add some pending tasks to mock database
+	mockDBStatus["PENDING1"] = db.RenderStatusPending
+	mockDBStatus["PENDING2"] = db.RenderStatusPending
+	mockDBStatus["RENDERING1"] = db.RenderStatusRendering // Should not be queued
+	mockDBStatus["COMPLETED1"] = db.RenderStatusCompleted // Should not be queued
+
+	// Run the periodic checker once
+	queue.checkAndQueuePendingTasks()
+
+	// Should have queued 2 pending tasks
+	assert.Equal(t, 2, len(queue.jobs), "Should have queued 2 pending tasks")
+
+	// Verify the jobs are correct
+	job1 := <-queue.jobs
+	job2 := <-queue.jobs
+
+	expectedJobs := map[string]bool{
+		"PENDING1": false,
+		"PENDING2": false,
+	}
+
+	expectedJobs[job1.ShortCode] = true
+	expectedJobs[job2.ShortCode] = true
+
+	assert.True(t, expectedJobs["PENDING1"], "PENDING1 should have been queued")
+	assert.True(t, expectedJobs["PENDING2"], "PENDING2 should have been queued")
+
+	// Verify in-progress status
+	assert.True(t, queue.inProgress["https://example.com/PENDING1"], "PENDING1 should be marked as in progress")
+	assert.True(t, queue.inProgress["https://example.com/PENDING2"], "PENDING2 should be marked as in progress")
+
+	// Clean up
+	close(queue.jobs)
+}
+
+func TestPeriodicTaskCheckerWithFullQueue(t *testing.T) {
+	// Reset mock DB state
+	resetMockDB()
+
+	queue := &RenderQueue{
+		jobs:        make(chan RenderJob, 5), // Small queue
+		inProgress:  make(map[string]bool),
+		workerCount: 1,
+		db:          &mockDB{},
+	}
+
+	// Fill the queue to near capacity (90% of 5 = 4.5, so >= 4)
+	for i := 0; i < 5; i++ {
+		queue.jobs <- RenderJob{ShortCode: fmt.Sprintf("FILL%d", i), OriginalURL: fmt.Sprintf("https://fill%d.com", i)}
+	}
+
+	// Add pending tasks to mock database
+	mockDBStatus["PENDING1"] = db.RenderStatusPending
+
+	// Run the periodic checker - should not queue anything because queue is full
+	queue.checkAndQueuePendingTasks()
+
+	// Queue should still be full with original jobs
+	assert.Equal(t, 5, len(queue.jobs), "Queue should still be full")
+
+	// Clean up
+	close(queue.jobs)
+}
+
+func TestPeriodicTaskCheckerWithInProgressTasks(t *testing.T) {
+	// Reset mock DB state
+	resetMockDB()
+
+	queue := &RenderQueue{
+		jobs:        make(chan RenderJob, 10),
+		inProgress:  make(map[string]bool),
+		workerCount: 1,
+		db:          &mockDB{},
+	}
+
+	// Add pending tasks to mock database
+	mockDBStatus["PENDING1"] = db.RenderStatusPending
+	mockDBStatus["PENDING2"] = db.RenderStatusPending
+
+	// Mark one as already in progress in memory
+	queue.inProgress["https://example.com/PENDING1"] = true
+
+	// Run the periodic checker
+	queue.checkAndQueuePendingTasks()
+
+	// Should have queued only 1 task (PENDING2)
+	assert.Equal(t, 1, len(queue.jobs), "Should have queued only 1 task")
+
+	job := <-queue.jobs
+	assert.Equal(t, "PENDING2", job.ShortCode, "Should have queued PENDING2")
+
+	// Clean up
+	close(queue.jobs)
+}
+
+func TestGetPendingTasksFromMockDB(t *testing.T) {
+	// Reset mock DB state
+	resetMockDB()
+
+	mockDB := &mockDB{}
+
+	// Add various status tasks
+	mockDBStatus["PENDING1"] = db.RenderStatusPending
+	mockDBStatus["PENDING2"] = db.RenderStatusPending
+	mockDBStatus["PENDING3"] = db.RenderStatusPending
+	mockDBStatus["RENDERING1"] = db.RenderStatusRendering
+	mockDBStatus["COMPLETED1"] = db.RenderStatusCompleted
+
+	// Test getting pending tasks with limit
+	pendingTasks, err := mockDB.GetPendingTasks(2)
+	assert.NoError(t, err)
+	assert.Len(t, pendingTasks, 2, "Should return exactly 2 pending tasks")
+
+	// Verify all returned tasks are pending
+	for _, task := range pendingTasks {
+		assert.Equal(t, db.RenderStatusPending, task.RenderStatus, "All returned tasks should be pending")
+	}
+
+	// Test getting all pending tasks
+	allPendingTasks, err := mockDB.GetPendingTasks(10)
+	assert.NoError(t, err)
+	assert.Len(t, allPendingTasks, 3, "Should return all 3 pending tasks")
 }

@@ -12,6 +12,7 @@ type DBInterface interface {
 	GetLinkByShortCode(shortCode string) (*db.Link, error)
 	UpdateLinkRenderStatus(shortCode string, status db.RenderStatus) error
 	UpdateLinkContent(shortCode string, htmlContent string, status db.RenderStatus) error
+	GetPendingTasks(limit int) ([]db.Link, error)
 }
 
 // RenderJob represents a rendering job in the queue
@@ -46,7 +47,10 @@ func InitRenderQueue(workerCount int) {
 		go GlobalRenderQueue.worker(i)
 	}
 
-	log.Printf("Initialized render queue with %d workers", workerCount)
+	// Start periodic task checker
+	go GlobalRenderQueue.periodicTaskChecker()
+
+	log.Printf("Initialized render queue with %d workers and periodic task checker", workerCount)
 }
 
 // dbWrapper implements DBInterface using the real database functions
@@ -62,6 +66,12 @@ func (d *dbWrapper) UpdateLinkRenderStatus(shortCode string, status db.RenderSta
 
 func (d *dbWrapper) UpdateLinkContent(shortCode string, htmlContent string, status db.RenderStatus) error {
 	return db.UpdateLinkContent(shortCode, htmlContent, status)
+}
+
+func (d *dbWrapper) GetPendingTasks(limit int) ([]db.Link, error) {
+	var pendingLinks []db.Link
+	err := db.DB.Where("render_status = ?", db.RenderStatusPending).Limit(limit).Find(&pendingLinks).Error
+	return pendingLinks, err
 }
 
 // QueueRender adds a job to the rendering queue if not already in progress
@@ -193,4 +203,49 @@ func (rq *RenderQueue) GetStatus() map[string]any {
 func (rq *RenderQueue) Shutdown() {
 	close(rq.jobs)
 	log.Println("Render queue shutdown initiated")
+}
+
+// periodicTaskChecker periodically checks for pending tasks and queues them
+func (rq *RenderQueue) periodicTaskChecker() {
+	ticker := time.NewTicker(30 * time.Second) // Check every 30 seconds
+	defer ticker.Stop()
+
+	log.Println("Periodic task checker started")
+
+	for range ticker.C {
+		rq.checkAndQueuePendingTasks()
+	}
+}
+
+// checkAndQueuePendingTasks finds pending tasks in the database and queues them
+func (rq *RenderQueue) checkAndQueuePendingTasks() {
+	// Only check if queue is not full
+	if len(rq.jobs) >= 90 { // Leave some buffer
+		return
+	}
+
+	// Get pending tasks from database using the interface
+	pendingLinks, err := rq.db.GetPendingTasks(10)
+	if err != nil {
+		log.Printf("Periodic checker: Error fetching pending tasks: %v", err)
+		return
+	}
+
+	if len(pendingLinks) == 0 {
+		return // No pending tasks
+	}
+
+	log.Printf("Periodic checker: Found %d pending tasks to queue", len(pendingLinks))
+
+	for _, link := range pendingLinks {
+		// Check if already in progress in memory
+		rq.mutex.RLock()
+		inProgress := rq.inProgress[link.OriginalURL]
+		rq.mutex.RUnlock()
+
+		if !inProgress {
+			log.Printf("Periodic checker: Queuing pending task for URL: %s (short code: %s)", link.OriginalURL, link.ShortCode)
+			rq.QueueRender(link.ShortCode, link.OriginalURL)
+		}
+	}
 }
