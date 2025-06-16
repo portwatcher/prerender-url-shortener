@@ -6,23 +6,42 @@ import (
 	"testing"
 	"time"
 
+	"prerender-url-shortener/internal/db"
+
+	"github.com/jinzhu/gorm"
 	"github.com/stretchr/testify/assert"
 )
 
 // Mock database functions for testing
-func mockUpdateLinkRenderStatus(shortCode, status string) error {
+var mockDBStatus = make(map[string]db.RenderStatus)
+
+// mockDB implements DBInterface for testing
+type mockDB struct{}
+
+func (m *mockDB) GetLinkByShortCode(shortCode string) (*db.Link, error) {
+	if status, exists := mockDBStatus[shortCode]; exists {
+		return &db.Link{
+			ShortCode:    shortCode,
+			OriginalURL:  "https://example.com", // Not used in tests
+			RenderStatus: status,
+		}, nil
+	}
+	return nil, gorm.ErrRecordNotFound
+}
+
+func (m *mockDB) UpdateLinkRenderStatus(shortCode string, status db.RenderStatus) error {
+	mockDBStatus[shortCode] = status
 	return nil
 }
 
-func mockUpdateLinkContent(shortCode, content, status string) error {
+func (m *mockDB) UpdateLinkContent(shortCode string, content string, status db.RenderStatus) error {
+	mockDBStatus[shortCode] = status
 	return nil
 }
 
-// Mock renderer function for testing
-func mockRenderPageWithRod(url string) (string, error) {
-	// Simulate some work
-	time.Sleep(10 * time.Millisecond)
-	return "<html><body>Mock content for " + url + "</body></html>", nil
+// Reset mock database state
+func resetMockDB() {
+	mockDBStatus = make(map[string]db.RenderStatus)
 }
 
 func TestInitRenderQueue(t *testing.T) {
@@ -42,6 +61,7 @@ func TestInitRenderQueue(t *testing.T) {
 				jobs:        make(chan RenderJob, 100),
 				inProgress:  make(map[string]bool),
 				workerCount: tt.workerCount,
+				db:          &mockDB{}, // Add mock database
 			}
 
 			// Start workers (without using the global variable)
@@ -64,6 +84,7 @@ func TestQueueRender(t *testing.T) {
 		jobs:        make(chan RenderJob, 10),
 		inProgress:  make(map[string]bool),
 		workerCount: 1,
+		db:          &mockDB{}, // Add mock database
 	}
 
 	tests := []struct {
@@ -87,12 +108,17 @@ func TestQueueRender(t *testing.T) {
 			shouldQueue: false,
 			setup: func() {
 				queue.inProgress["https://example.com"] = true
+				// Set database status to rendering to prevent re-queuing
+				mockDBStatus["DEF456"] = db.RenderStatusRendering
 			},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			// Reset mock DB state
+			resetMockDB()
+
 			tt.setup()
 
 			initialQueueLength := len(queue.jobs)
@@ -116,6 +142,7 @@ func TestIsInProgress(t *testing.T) {
 		jobs:        make(chan RenderJob, 10),
 		inProgress:  make(map[string]bool),
 		workerCount: 1,
+		db:          &mockDB{}, // Add mock database
 	}
 
 	testURL := "https://test.com"
@@ -143,6 +170,7 @@ func TestGetStatus(t *testing.T) {
 		jobs:        make(chan RenderJob, 10),
 		inProgress:  make(map[string]bool),
 		workerCount: 3,
+		db:          &mockDB{}, // Add mock database
 	}
 
 	// Add some test data
@@ -183,6 +211,7 @@ func TestConcurrentQueueOperations(t *testing.T) {
 		jobs:        make(chan RenderJob, 100),
 		inProgress:  make(map[string]bool),
 		workerCount: 5,
+		db:          &mockDB{}, // Add mock database
 	}
 
 	const numGoroutines = 10
@@ -224,6 +253,7 @@ func TestQueueCapacity(t *testing.T) {
 		jobs:        make(chan RenderJob, 2), // Small capacity
 		inProgress:  make(map[string]bool),
 		workerCount: 1,
+		db:          &mockDB{}, // Add mock database
 	}
 
 	// Fill the queue
@@ -245,16 +275,26 @@ func TestQueueCapacity(t *testing.T) {
 }
 
 func TestQueueRenderDuplicateURLs(t *testing.T) {
+	// Reset mock DB state
+	resetMockDB()
+
 	queue := &RenderQueue{
 		jobs:        make(chan RenderJob, 10),
 		inProgress:  make(map[string]bool),
 		workerCount: 1,
+		db:          &mockDB{}, // Add mock database
 	}
 
 	// Queue the same URL multiple times
 	url := "https://duplicate.com"
 	queue.QueueRender("CODE1", url)
+
+	// Set database status to rendering to prevent re-queuing
+	mockDBStatus["CODE2"] = db.RenderStatusRendering
 	queue.QueueRender("CODE2", url) // Should be skipped
+
+	// Set database status to rendering to prevent re-queuing
+	mockDBStatus["CODE3"] = db.RenderStatusRendering
 	queue.QueueRender("CODE3", url) // Should be skipped
 
 	// Only one job should be queued
@@ -270,6 +310,7 @@ func BenchmarkQueueRender(b *testing.B) {
 		jobs:        make(chan RenderJob, 1000),
 		inProgress:  make(map[string]bool),
 		workerCount: 1,
+		db:          &mockDB{}, // Add mock database
 	}
 
 	b.ResetTimer()
@@ -287,6 +328,7 @@ func BenchmarkIsInProgress(b *testing.B) {
 		jobs:        make(chan RenderJob, 100),
 		inProgress:  make(map[string]bool),
 		workerCount: 1,
+		db:          &mockDB{}, // Add mock database
 	}
 
 	// Add some URLs to the in-progress map
@@ -298,5 +340,119 @@ func BenchmarkIsInProgress(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		url := fmt.Sprintf("https://bench%d.com", i%100)
 		queue.IsInProgress(url)
+	}
+}
+
+func TestQueueRenderWithDatabaseStatus(t *testing.T) {
+	tests := []struct {
+		name           string
+		shortCode      string
+		originalURL    string
+		inProgress     bool
+		dbStatus       db.RenderStatus
+		shouldQueue    bool
+		expectedStatus db.RenderStatus
+	}{
+		{
+			name:           "new URL not in progress",
+			shortCode:      "NEW1",
+			originalURL:    "https://new1.com",
+			inProgress:     false,
+			dbStatus:       db.RenderStatusPending,
+			shouldQueue:    true,
+			expectedStatus: db.RenderStatusPending,
+		},
+		{
+			name:           "URL in progress with pending status",
+			shortCode:      "PENDING1",
+			originalURL:    "https://pending1.com",
+			inProgress:     true,
+			dbStatus:       db.RenderStatusPending,
+			shouldQueue:    true, // Should re-queue because DB status is pending
+			expectedStatus: db.RenderStatusPending,
+		},
+		{
+			name:           "URL in progress with rendering status",
+			shortCode:      "RENDERING1",
+			originalURL:    "https://rendering1.com",
+			inProgress:     true,
+			dbStatus:       db.RenderStatusRendering,
+			shouldQueue:    false, // Should not queue because DB status is rendering
+			expectedStatus: db.RenderStatusRendering,
+		},
+		{
+			name:           "URL in progress with completed status",
+			shortCode:      "COMPLETE1",
+			originalURL:    "https://complete1.com",
+			inProgress:     true,
+			dbStatus:       db.RenderStatusCompleted,
+			shouldQueue:    false, // Should not queue because DB status is completed
+			expectedStatus: db.RenderStatusCompleted,
+		},
+		{
+			name:           "URL in progress with failed status",
+			shortCode:      "FAILED1",
+			originalURL:    "https://failed1.com",
+			inProgress:     true,
+			dbStatus:       db.RenderStatusFailed,
+			shouldQueue:    false, // Should not queue because DB status is failed
+			expectedStatus: db.RenderStatusFailed,
+		},
+		{
+			name:           "URL in progress but not in database",
+			shortCode:      "MISSING1",
+			originalURL:    "https://missing1.com",
+			inProgress:     true,
+			dbStatus:       "",    // Not set in mock DB
+			shouldQueue:    false, // Should not queue because DB lookup failed
+			expectedStatus: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Reset mock DB state
+			resetMockDB()
+
+			// Set up initial state
+			queue := &RenderQueue{
+				jobs:        make(chan RenderJob, 10),
+				inProgress:  make(map[string]bool),
+				workerCount: 1,
+				db:          &mockDB{}, // Inject mock DB
+			}
+
+			if tt.inProgress {
+				queue.inProgress[tt.originalURL] = true
+			}
+
+			if tt.dbStatus != "" {
+				mockDBStatus[tt.shortCode] = tt.dbStatus
+			}
+
+			// Record initial queue length
+			initialQueueLength := len(queue.jobs)
+
+			// Attempt to queue the job
+			queue.QueueRender(tt.shortCode, tt.originalURL)
+
+			// Verify queue length
+			if tt.shouldQueue {
+				assert.Equal(t, initialQueueLength+1, len(queue.jobs), "Queue length should have increased")
+				assert.True(t, queue.inProgress[tt.originalURL], "URL should be marked as in progress")
+			} else {
+				assert.Equal(t, initialQueueLength, len(queue.jobs), "Queue length should not have changed")
+				if tt.dbStatus == db.RenderStatusPending {
+					assert.False(t, queue.inProgress[tt.originalURL], "URL should not be marked as in progress for pending status")
+				} else {
+					assert.Equal(t, tt.inProgress, queue.inProgress[tt.originalURL], "In-progress status should remain unchanged")
+				}
+			}
+
+			// Verify database status if it was set
+			if tt.dbStatus != "" {
+				assert.Equal(t, tt.expectedStatus, mockDBStatus[tt.shortCode], "Database status should match expected")
+			}
+		})
 	}
 }

@@ -7,6 +7,13 @@ import (
 	"time"
 )
 
+// DBInterface defines the database operations needed by the render queue
+type DBInterface interface {
+	GetLinkByShortCode(shortCode string) (*db.Link, error)
+	UpdateLinkRenderStatus(shortCode string, status db.RenderStatus) error
+	UpdateLinkContent(shortCode string, htmlContent string, status db.RenderStatus) error
+}
+
 // RenderJob represents a rendering job in the queue
 type RenderJob struct {
 	ShortCode   string
@@ -20,6 +27,7 @@ type RenderQueue struct {
 	inProgress  map[string]bool // Track URLs currently being rendered (URL as key)
 	mutex       sync.RWMutex
 	workerCount int
+	db          DBInterface // Database interface for status checks and updates
 }
 
 var GlobalRenderQueue *RenderQueue
@@ -30,6 +38,7 @@ func InitRenderQueue(workerCount int) {
 		jobs:        make(chan RenderJob, 100), // Buffer for 100 jobs
 		inProgress:  make(map[string]bool),
 		workerCount: workerCount,
+		db:          &dbWrapper{}, // Use the real database implementation
 	}
 
 	// Start worker goroutines
@@ -40,6 +49,21 @@ func InitRenderQueue(workerCount int) {
 	log.Printf("Initialized render queue with %d workers", workerCount)
 }
 
+// dbWrapper implements DBInterface using the real database functions
+type dbWrapper struct{}
+
+func (d *dbWrapper) GetLinkByShortCode(shortCode string) (*db.Link, error) {
+	return db.GetLinkByShortCode(shortCode)
+}
+
+func (d *dbWrapper) UpdateLinkRenderStatus(shortCode string, status db.RenderStatus) error {
+	return db.UpdateLinkRenderStatus(shortCode, status)
+}
+
+func (d *dbWrapper) UpdateLinkContent(shortCode string, htmlContent string, status db.RenderStatus) error {
+	return db.UpdateLinkContent(shortCode, htmlContent, status)
+}
+
 // QueueRender adds a job to the rendering queue if not already in progress
 func (rq *RenderQueue) QueueRender(shortCode, originalURL string) {
 	rq.mutex.Lock()
@@ -47,10 +71,24 @@ func (rq *RenderQueue) QueueRender(shortCode, originalURL string) {
 
 	log.Printf("Queue: Attempting to queue render job for URL: %s (short code: %s)", originalURL, shortCode)
 
-	// Check if this URL is already being rendered
+	// Check if this URL is already being rendered in memory
 	if rq.inProgress[originalURL] {
-		log.Printf("Queue: URL %s is already being rendered, not queuing duplicate", originalURL)
-		return
+		// Double check database status to handle application restarts
+		link, err := rq.db.GetLinkByShortCode(shortCode)
+		if err != nil {
+			log.Printf("Queue: Error checking database status for %s: %v", shortCode, err)
+			return
+		}
+
+		// If status is pending, it means the application was restarted
+		// and we should re-queue this task
+		if link.RenderStatus == db.RenderStatusPending {
+			log.Printf("Queue: URL %s was in memory but has pending status in database, re-queuing", originalURL)
+			delete(rq.inProgress, originalURL)
+		} else {
+			log.Printf("Queue: URL %s is already being rendered, not queuing duplicate", originalURL)
+			return
+		}
 	}
 
 	// Mark as in progress and queue the job
@@ -86,7 +124,7 @@ func (rq *RenderQueue) worker(id int) {
 
 		// Update status to rendering
 		log.Printf("Worker %d: Updating database status to 'rendering' for %s", id, job.ShortCode)
-		if err := db.UpdateLinkRenderStatus(job.ShortCode, db.RenderStatusRendering); err != nil {
+		if err := rq.db.UpdateLinkRenderStatus(job.ShortCode, db.RenderStatusRendering); err != nil {
 			log.Printf("Worker %d: Failed to update status to rendering for %s: %v", id, job.ShortCode, err)
 		} else {
 			log.Printf("Worker %d: Successfully updated status to 'rendering' for %s", id, job.ShortCode)
@@ -104,7 +142,7 @@ func (rq *RenderQueue) worker(id int) {
 			log.Printf("Worker %d: Failed to render %s after %v: %v", id, job.OriginalURL, renderDuration, err)
 			// Update status to failed
 			log.Printf("Worker %d: Updating database status to 'failed' for %s", id, job.ShortCode)
-			if dbErr := db.UpdateLinkContent(job.ShortCode, "", db.RenderStatusFailed); dbErr != nil {
+			if dbErr := rq.db.UpdateLinkContent(job.ShortCode, "", db.RenderStatusFailed); dbErr != nil {
 				log.Printf("Worker %d: Failed to update status to failed for %s: %v", id, job.ShortCode, dbErr)
 			} else {
 				log.Printf("Worker %d: Successfully updated status to 'failed' for %s", id, job.ShortCode)
@@ -113,7 +151,7 @@ func (rq *RenderQueue) worker(id int) {
 			log.Printf("Worker %d: Successfully rendered %s in %v (HTML length: %d)", id, job.OriginalURL, renderDuration, len(htmlContent))
 			// Update with rendered content
 			log.Printf("Worker %d: Saving rendered content to database for %s", id, job.ShortCode)
-			if dbErr := db.UpdateLinkContent(job.ShortCode, htmlContent, db.RenderStatusCompleted); dbErr != nil {
+			if dbErr := rq.db.UpdateLinkContent(job.ShortCode, htmlContent, db.RenderStatusCompleted); dbErr != nil {
 				log.Printf("Worker %d: Failed to save rendered content for %s: %v", id, job.ShortCode, dbErr)
 			} else {
 				log.Printf("Worker %d: Successfully saved rendered content for %s", id, job.ShortCode)
