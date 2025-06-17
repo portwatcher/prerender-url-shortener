@@ -82,9 +82,19 @@ func GenerateShortCodeHandler(c *gin.Context) {
 		// Check current render status
 		switch existingLink.RenderStatus {
 		case db.RenderStatusCompleted:
-			// Always return 202 Accepted and trigger re-render to ensure freshness
-			// Only bots will get the actual HTML if it has valid og:image tag
-			log.Printf("URL %s exists with completed status, re-queuing for fresh render and returning 202", req.URL)
+			// Check if rendered HTML content is valid (contains og:image tag)
+			if existingLink.RenderedHTMLContent != "" && hasOGImageTag(existingLink.RenderedHTMLContent) {
+				// HTML is valid with og:image tag, return 200 OK without re-rendering
+				log.Printf("URL %s exists with valid rendered HTML (has og:image), returning 200 OK", req.URL)
+				c.JSON(http.StatusOK, GenerateResponse{
+					ShortCode:   existingLink.ShortCode,
+					OriginalURL: existingLink.OriginalURL,
+				})
+				return
+			}
+
+			// HTML is missing or invalid (no og:image tag), trigger re-render
+			log.Printf("URL %s exists but HTML is invalid or missing og:image, re-queuing for fresh render and returning 202", req.URL)
 
 			// Update status to pending and queue for re-rendering
 			if updateErr := db.UpdateLinkRenderStatus(existingLink.ShortCode, db.RenderStatusPending); updateErr != nil {
