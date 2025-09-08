@@ -284,6 +284,33 @@ func TestUpdateLinkContent(t *testing.T) {
 	}
 }
 
+func TestUpdateLinkContentStripsNUL(t *testing.T) {
+    setupTestDB(t)
+    defer teardownTestDB(t)
+
+    // Create test link
+    testLink := &Link{
+        ShortCode:    "NUL123",
+        OriginalURL:  "https://nul.test",
+        RenderStatus: RenderStatusRendering,
+    }
+    err := CreateLink(testLink)
+    require.NoError(t, err)
+
+    // Content with embedded NUL bytes
+    raw := "<html>\x00<body>NUL\x00byte</body>\x00</html>"
+
+    // Update content — should strip NULs
+    err = UpdateLinkContent("NUL123", raw, RenderStatusCompleted)
+    assert.NoError(t, err)
+
+    // Verify content stored without NUL bytes
+    link, err := GetLinkByShortCode("NUL123")
+    require.NoError(t, err)
+    assert.NotContains(t, link.RenderedHTMLContent, "\x00")
+    assert.Equal(t, RenderStatusCompleted, link.RenderStatus)
+}
+
 func TestRenderStatus(t *testing.T) {
 	tests := []struct {
 		name   string

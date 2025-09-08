@@ -1,6 +1,8 @@
 package db
 
 import (
+	"strings"
+
 	"github.com/jinzhu/gorm"
 	_ "github.com/jinzhu/gorm/dialects/postgres" // PostgreSQL driver
 )
@@ -73,6 +75,12 @@ func UpdateLinkRenderStatus(shortCode string, status RenderStatus) error {
 
 // UpdateLinkContent updates the rendered HTML content and status of a link.
 func UpdateLinkContent(shortCode string, htmlContent string, status RenderStatus) error {
+	// PostgreSQL TEXT cannot contain NUL (0x00). Strip any NUL bytes
+	// that may appear in rendered HTML before saving.
+	if strings.ContainsRune(htmlContent, rune(0)) {
+		htmlContent = strings.ReplaceAll(htmlContent, "\x00", "")
+	}
+
 	return DB.Model(&Link{}).Where("short_code = ?", shortCode).Updates(map[string]any{
 		"rendered_html_content": htmlContent,
 		"render_status":         status,
