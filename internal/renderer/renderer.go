@@ -1,18 +1,26 @@
 package renderer
 
 import (
-	"context"
-	"fmt"
-	"log"
-	"prerender-url-shortener/internal/config"
-	"regexp"
-	"strings"
-	"time"
+    "context"
+    "fmt"
+    "log"
+    "prerender-url-shortener/internal/config"
+    "regexp"
+    "strings"
+    "time"
 
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/launcher"
 	"github.com/go-rod/rod/lib/proto"
 )
+
+// truncateForLog shortens long strings in logs to avoid noisy output.
+func truncateForLog(s string, max int) string {
+    if len(s) <= max || max <= 3 {
+        return s
+    }
+    return s[:max] + "..."
+}
 
 // RenderPageWithRod fetches a URL using Rod, waits for JavaScript to render (basic wait),
 // and returns the full HTML content.
@@ -183,9 +191,10 @@ func waitForMetaFinalization(page *rod.Page) (string, error) {
         // html captured for checks below
 
 		// If a custom ready marker is present, we're done
-		if readyMarker != "" && strings.Contains(html, readyMarker) {
-			return html, nil
-		}
+        if readyMarker != "" && strings.Contains(html, readyMarker) {
+            log.Printf("Rod: Ready marker detected ('%s'); finishing render", readyMarker)
+            return html, nil
+        }
 
         // Extract og:image
         og := ""
@@ -195,25 +204,35 @@ func waitForMetaFinalization(page *rod.Page) (string, error) {
 
         // Only loop for stability when og:image exists
         if og != "" {
-            if og == lastOG {
-                stableCount++
-            } else {
+            // Log first detection or changes to og:image
+            if lastOG == "" {
+                log.Printf("Rod: Detected og:image: %s", truncateForLog(og, 200))
                 stableCount = 1
+            } else if og != lastOG {
+                log.Printf("Rod: og:image changed -> old: %s | new: %s", truncateForLog(lastOG, 200), truncateForLog(og, 200))
+                stableCount = 1
+            } else {
+                stableCount++
             }
             lastOG = og
+            log.Printf("Rod: og:image stability progress %d/%d", stableCount, stableTarget)
             if stableCount >= stableTarget {
+                log.Printf("Rod: og:image stabilized after %d checks: %s", stableCount, truncateForLog(og, 200))
                 return html, nil
             }
         } else {
             // If no og:image is present repeatedly, don't wait the full timeout.
             // This keeps the renderer generic while avoiding long waits for pages without OG metadata.
             emptyCount++
+            log.Printf("Rod: No og:image detected (emptyCount %d/3)", emptyCount)
             if emptyCount >= 3 { // ~1.5s given 500ms tick
+                log.Printf("Rod: Exiting early: og:image not present after brief wait")
                 return html, nil
             }
         }
 
         if time.Now().After(deadline) {
+            log.Printf("Rod: Meta wait timeout after %v. Last og:image: %s", timeout, truncateForLog(lastOG, 200))
             return html, fmt.Errorf("meta wait timeout after %v", timeout)
         }
         <-ticker.C
