@@ -167,10 +167,11 @@ func waitForMetaFinalization(page *rod.Page) (string, error) {
 	}
 
     // Regex to extract meta content attributes
-    // Matches: <meta property="og:image" ... content="...">
+    // Matches either attribute form:
+    //   <meta property="og:image" content="..."> OR <meta name="og:image" content="...">
     // Note: We intentionally ignore twitter:image for stabilization. The renderer remains generic
     // and will only loop for stability when an og:image is present.
-    ogRe := regexp.MustCompile(`(?i)<meta[^>]+property=["']og:image["'][^>]*content=["']([^"']+)["'][^>]*>`) //nolint:lll
+    ogRe := regexp.MustCompile(`(?i)<meta[^>]+(?:property|name)=["']og:image["'][^>]*content=["']([^"']+)["'][^>]*>`) //nolint:lll
 
 	deadline := time.Now().Add(timeout)
 	ticker := time.NewTicker(500 * time.Millisecond)
