@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"prerender-url-shortener/internal/config"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/go-rod/rod"
@@ -102,7 +104,7 @@ func renderWithRod(url string) (string, error) {
 		return "", fmt.Errorf("failed to create page for %s: %w", url, err)
 	}
 	log.Printf("Rod: Page created successfully for URL: %s", url)
-	//nolint:errcheck
+
 	defer func() {
 		log.Printf("Rod: Closing page for URL: %s", url)
 		page.MustClose() // MustClose panics on error, no return to check.
@@ -121,7 +123,6 @@ func renderWithRod(url string) (string, error) {
 	// Wait for network to be almost idle, this is a good indicator for SPAs
 	// Using a timeout to prevent indefinite blocking
 	log.Printf("Rod: Waiting for network to be almost idle for URL: %s (timeout: 30s)", url)
-	//nolint:errcheck
 	page.Timeout(30 * time.Second).WaitNavigation(proto.PageLifecycleEventNameNetworkAlmostIdle)()
 	log.Printf("Rod: Network almost idle wait completed for URL: %s", url)
 
@@ -130,12 +131,91 @@ func renderWithRod(url string) (string, error) {
 	time.Sleep(2 * time.Second)
 	log.Printf("Rod: Additional wait completed for URL: %s", url)
 
-	log.Printf("Rod: Extracting HTML content for URL: %s", url)
-	html, err := page.HTML()
+    // Wait for metas (e.g., og:image) to reach their final state or a ready marker
+	log.Printf("Rod: Waiting for meta stabilization for URL: %s", url)
+	finalHTML, err := waitForMetaFinalization(page)
 	if err != nil {
-		return "", fmt.Errorf("failed to get HTML content for %s: %w", url, err)
+		log.Printf("Rod: Meta stabilization wait ended with error for URL: %s: %v. Returning current HTML.", url, err)
+		// Best-effort fallback to current HTML
+		html, hErr := page.HTML()
+		if hErr != nil {
+			return "", fmt.Errorf("failed to get HTML content after meta wait for %s: %w", url, hErr)
+		}
+		return html, nil
 	}
-	log.Printf("Rod: Successfully extracted HTML content for URL: %s (length: %d characters)", url, len(html))
+	log.Printf("Rod: Meta stabilization complete for URL: %s (length: %d characters)", url, len(finalHTML))
+	return finalHTML, nil
+}
 
-	return html, nil
+// waitForMetaFinalization polls the page HTML until either:
+// - The configured ready marker is present in the HTML, or
+// - The og:image meta content is stable for N consecutive checks (only if an og:image exists),
+// or times out based on config.
+func waitForMetaFinalization(page *rod.Page) (string, error) {
+	timeout := time.Duration(config.AppConfig.MetaWaitTimeoutSeconds) * time.Second
+	stableTarget := config.AppConfig.MetaStableConsecutiveChecks
+	if stableTarget < 1 {
+		stableTarget = 1
+	}
+
+    // Regex to extract meta content attributes
+    // Matches: <meta property="og:image" ... content="...">
+    // Note: We intentionally ignore twitter:image for stabilization. The renderer remains generic
+    // and will only loop for stability when an og:image is present.
+    ogRe := regexp.MustCompile(`(?i)<meta[^>]+property=["']og:image["'][^>]*content=["']([^"']+)["'][^>]*>`) //nolint:lll
+
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+    var lastOG string
+    stableCount := 0
+    emptyCount := 0
+
+	readyMarker := strings.TrimSpace(config.AppConfig.PrerenderReadyMarker)
+
+	for {
+		// Fetch current HTML
+		html, err := page.HTML()
+		if err != nil {
+			return "", fmt.Errorf("failed to get HTML during meta wait: %w", err)
+		}
+        // html captured for checks below
+
+		// If a custom ready marker is present, we're done
+		if readyMarker != "" && strings.Contains(html, readyMarker) {
+			return html, nil
+		}
+
+        // Extract og:image
+        og := ""
+        if m := ogRe.FindStringSubmatch(html); len(m) > 1 {
+            og = m[1]
+        }
+
+        // Only loop for stability when og:image exists
+        if og != "" {
+            if og == lastOG {
+                stableCount++
+            } else {
+                stableCount = 1
+            }
+            lastOG = og
+            if stableCount >= stableTarget {
+                return html, nil
+            }
+        } else {
+            // If no og:image is present repeatedly, don't wait the full timeout.
+            // This keeps the renderer generic while avoiding long waits for pages without OG metadata.
+            emptyCount++
+            if emptyCount >= 3 { // ~1.5s given 500ms tick
+                return html, nil
+            }
+        }
+
+        if time.Now().After(deadline) {
+            return html, fmt.Errorf("meta wait timeout after %v", timeout)
+        }
+        <-ticker.C
+    }
 }

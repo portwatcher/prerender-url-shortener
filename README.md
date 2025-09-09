@@ -104,15 +104,30 @@ When a URL is submitted via the `/generate` endpoint:
 git clone <repository-url>
 cd prerender-url-shortener
 ```
-2.  **Create a `.env` file** in the project root with your configuration. See `.env.example` for a template (if one exists, otherwise define the following):
+2.  **Create a `.env` file** in the project root with your configuration. See `.env.example` for a template (if one exists). Current configuration options:
 
 ```env
+# Required
 DATABASE_URL="postgres://user:password@host:port/dbname?sslmode=disable"
-SERVER_PORT=":8080" # Optional, defaults to :8080
-ALLOWED_DOMAINS="example.com,another.org" # Optional, comma-separated, empty means allow all
-ROD_BIN_PATH="" # Optional, path to Chrome/Chromium binary if not in system PATH or for specific version
-RENDER_WORKER_COUNT="3" # Optional, number of background rendering workers, defaults to 3
+
+# Server
+SERVER_PORT=":8080"                       # Optional, default :8080
+ALLOWED_DOMAINS="example.com,another.org" # Optional, comma-separated; empty means allow all
+
+# Renderer / Rod
+ROD_BIN_PATH=""                           # Optional, path to Chrome/Chromium binary
+RENDER_WORKER_COUNT="3"                   # Optional, default 3 workers
+RENDER_TIMEOUT_SECONDS="90"               # Optional, default 90s overall per-page timeout
+
+# Prerender stabilization
+META_WAIT_TIMEOUT_SECONDS="20"            # Optional, default 20s max wait for meta stabilization
+META_STABLE_CONSECUTIVE_CHECKS="3"        # Optional, default 3 equal reads for stability
+PRERENDER_READY_MARKER="data-prerender-ready=\"true\""  # Optional marker that, if present in HTML, ends waiting early
 ```
+
+Notes:
+- PRERENDER_READY_MARKER: leave it as default or set to an empty value to disable marker-based early exit. The renderer still returns once og:image stabilizes or after a brief loop if no og:image is present.
+- Without a ready marker: behavior is generic — waits for load + network idle; then only loops for og:image stabilization if an og:image exists.
 
 3.  **Install dependencies:**
 ```bash
