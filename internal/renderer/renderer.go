@@ -140,8 +140,15 @@ func renderWithRod(url string) (string, error) {
 	log.Printf("Rod: Additional wait completed for URL: %s", url)
 
     // Wait for metas (e.g., og:image) to reach their final state or a ready marker
-	log.Printf("Rod: Waiting for meta stabilization for URL: %s", url)
-	finalHTML, err := waitForMetaFinalization(page)
+    // Try to extract an expected content identifier from the requested URL (e.g., post/comic id)
+    var expectedID string
+    if m := regexp.MustCompile(`/(posts|comics)/([^/?#]+)`).FindStringSubmatch(url); len(m) > 2 {
+        expectedID = m[2]
+        log.Printf("Rod: Expected content identifier extracted from URL: %s", expectedID)
+    }
+
+    log.Printf("Rod: Waiting for meta stabilization for URL: %s", url)
+    finalHTML, err := waitForMetaFinalization(page, expectedID)
 	if err != nil {
 		log.Printf("Rod: Meta stabilization wait ended with error for URL: %s: %v. Returning current HTML.", url, err)
 		// Best-effort fallback to current HTML
@@ -158,8 +165,9 @@ func renderWithRod(url string) (string, error) {
 // waitForMetaFinalization polls the page HTML until either:
 // - The configured ready marker is present in the HTML, or
 // - The og:image meta content is stable for N consecutive checks (only if an og:image exists),
+//   and if og:url is present it also stabilizes and matches the expectedID (when provided),
 // or times out based on config.
-func waitForMetaFinalization(page *rod.Page) (string, error) {
+func waitForMetaFinalization(page *rod.Page, expectedID string) (string, error) {
 	timeout := time.Duration(config.AppConfig.MetaWaitTimeoutSeconds) * time.Second
 	stableTarget := config.AppConfig.MetaStableConsecutiveChecks
 	if stableTarget < 1 {
@@ -169,16 +177,20 @@ func waitForMetaFinalization(page *rod.Page) (string, error) {
     // Regex to extract meta content attributes
     // Matches either attribute form:
     //   <meta property="og:image" content="..."> OR <meta name="og:image" content="...">
+    //   <meta property="og:url"   content="..."> OR <meta name="og:url"   content="...">
     // Note: We intentionally ignore twitter:image for stabilization. The renderer remains generic
     // and will only loop for stability when an og:image is present.
-    ogRe := regexp.MustCompile(`(?i)<meta[^>]+(?:property|name)=["']og:image["'][^>]*content=["']([^"']+)["'][^>]*>`) //nolint:lll
+    ogRe := regexp.MustCompile(`(?i)<meta[^>]+(?:property|name)=["']og:image["'][^>]*content=["']([^"']+)["'][^>]*>`)  //nolint:lll
+    ogURLRe := regexp.MustCompile(`(?i)<meta[^>]+(?:property|name)=["']og:url["'][^>]*content=["']([^"']+)["'][^>]*>`) //nolint:lll
 
 	deadline := time.Now().Add(timeout)
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
     var lastOG string
-    stableCount := 0
+    var lastOGURL string
+    stableCountOG := 0
+    stableCountURL := 0
     emptyCount := 0
 
 	readyMarker := strings.TrimSpace(config.AppConfig.PrerenderReadyMarker)
@@ -197,10 +209,32 @@ func waitForMetaFinalization(page *rod.Page) (string, error) {
             return html, nil
         }
 
-        // Extract og:image
+        // Extract og:image and og:url
         og := ""
         if m := ogRe.FindStringSubmatch(html); len(m) > 1 {
             og = m[1]
+        }
+        ogURL := ""
+        if m := ogURLRe.FindStringSubmatch(html); len(m) > 1 {
+            ogURL = m[1]
+        }
+
+        // Track og:url stability (when present) and whether it matches the expected ID
+        if ogURL != "" {
+            if lastOGURL == "" {
+                log.Printf("Rod: Detected og:url: %s", truncateForLog(ogURL, 200))
+                stableCountURL = 1
+            } else if ogURL != lastOGURL {
+                log.Printf("Rod: og:url changed -> old: %s | new: %s", truncateForLog(lastOGURL, 200), truncateForLog(ogURL, 200))
+                stableCountURL = 1
+            } else {
+                stableCountURL++
+            }
+            lastOGURL = ogURL
+            if expectedID != "" && !strings.Contains(ogURL, expectedID) {
+                log.Printf("Rod: Warning: og:url does not contain expected id '%s' yet", expectedID)
+            }
+            log.Printf("Rod: og:url stability progress %d/%d", stableCountURL, stableTarget)
         }
 
         // Only loop for stability when og:image exists
@@ -208,17 +242,27 @@ func waitForMetaFinalization(page *rod.Page) (string, error) {
             // Log first detection or changes to og:image
             if lastOG == "" {
                 log.Printf("Rod: Detected og:image: %s", truncateForLog(og, 200))
-                stableCount = 1
+                stableCountOG = 1
             } else if og != lastOG {
                 log.Printf("Rod: og:image changed -> old: %s | new: %s", truncateForLog(lastOG, 200), truncateForLog(og, 200))
-                stableCount = 1
+                stableCountOG = 1
             } else {
-                stableCount++
+                stableCountOG++
             }
             lastOG = og
-            log.Printf("Rod: og:image stability progress %d/%d", stableCount, stableTarget)
-            if stableCount >= stableTarget {
-                log.Printf("Rod: og:image stabilized after %d checks: %s", stableCount, truncateForLog(og, 200))
+            log.Printf("Rod: og:image stability progress %d/%d", stableCountOG, stableTarget)
+
+            // Completion condition: og:image is stable; if og:url exists, it must also be stable
+            // and (when expectedID is provided) contain that id.
+            urlOK := true
+            if ogURL != "" {
+                urlOK = stableCountURL >= stableTarget && (expectedID == "" || strings.Contains(ogURL, expectedID))
+            }
+            if stableCountOG >= stableTarget && urlOK {
+                log.Printf("Rod: og:image stabilized after %d checks: %s", stableCountOG, truncateForLog(og, 200))
+                if ogURL != "" {
+                    log.Printf("Rod: og:url stabilized after %d checks: %s", stableCountURL, truncateForLog(ogURL, 200))
+                }
                 return html, nil
             }
         } else {
